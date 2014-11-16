@@ -5,8 +5,8 @@
    swap implementations"
   (:require [clojure.string                   :as str]
             [qbits.alia                       :as alia]
-            [qbits.alia.policy.reconnection   :as reconn]
-            [qbits.alia.policy.retry          :as retry]
+            [qbits.alia.policy.reconnection   :as rc]
+            [qbits.alia.policy.retry          :as rt]
             [qbits.alia.policy.load-balancing :as lb]
             [io.cyanite.util                  :refer [partition-or-time go-forever go-catch]]
             [clojure.tools.logging            :refer [error info debug]]
@@ -149,8 +149,8 @@
   (let [cluster (if (sequential? cluster) cluster [cluster])
         session (-> (alia/cluster {:contact-points cluster
                                    :load-balancing-policy (lb/round-robin-policy)
-                                   :reconnection-policy (reconn/constant-reconnection-policy 10)
-                                   :retry-policy (retry/downgrading-consistency-retry-policy)})
+                                   :reconnection-policy (rc/constant-reconnection-policy 10)
+                                   :retry-policy (rt/downgrading-consistency-retry-policy)})
                     (alia/connect keyspace))
         insert! (insertq session)
         fetch!  (fetchq session)]
@@ -158,7 +158,7 @@
       Metricstore
       (channel-for [this]
         (let [ch   (chan 10000)
-              ch-p (partition-or-time 500 ch 500 5)]
+              ch-p (partition-or-time 50 ch 1000 5)]
           (go-forever
            (let [payload (<! ch-p)]
              (try
