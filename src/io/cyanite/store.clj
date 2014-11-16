@@ -3,14 +3,17 @@
    relies on a single schema. All cassandra interaction bits
    should quickly be abstracted with a protocol to more easily
    swap implementations"
-  (:require [clojure.string        :as str]
-            [qbits.alia            :as alia]
-            [io.cyanite.util       :refer [partition-or-time
-                                           go-forever go-catch]]
-            [clojure.tools.logging :refer [error info debug]]
-            [clojure.core.async    :refer [take! <! >! go chan]])
+  (:require [clojure.string                   :as str]
+            [qbits.alia                       :as alia]
+            [qbits.alia.policy.reconnection   :as reconn]
+            [qbits.alia.policy.retry          :as retry]
+            [qbits.alia.policy.load-balancing :as lb]
+            [io.cyanite.util                  :refer [partition-or-time go-forever go-catch]]
+            [clojure.tools.logging            :refer [error info debug]]
+            [clojure.core.async               :refer [take! <! >! go chan]])
   (:import [com.datastax.driver.core
             BatchStatement
+            BatchStatement$Type
             PreparedStatement]))
 
 (set! *warn-on-reflection* true)
@@ -129,9 +132,9 @@
                  (map :metric))))
 
 (defn- batch
-  "Creates a batch of prepared statements"
+  "Creates an unlogged batch of prepared statements"
   [^PreparedStatement s values]
-  (let [b (BatchStatement.)]
+  (let [b (BatchStatement. (BatchStatement$Type/UNLOGGED))]
     (doseq [v values]
       (.add b (.bind s (into-array Object v))))
     b))
@@ -144,7 +147,10 @@
                                 :replication_factor (or repfactor 3)}}}}]
   (info "creating cassandra metric store")
   (let [cluster (if (sequential? cluster) cluster [cluster])
-        session (-> (alia/cluster {:contact-points cluster})
+        session (-> (alia/cluster {:contact-points cluster
+                                   :load-balancing-policy (lb/round-robin-policy)
+                                   :reconnection-policy (reconn/constant-reconnection-policy 10)
+                                   :retry-policy (retry/downgrading-consistency-retry-policy)})
                     (alia/connect keyspace))
         insert! (insertq session)
         fetch!  (fetchq session)]
@@ -173,7 +179,8 @@
         (alia/execute-chan
          session
          insert!
-         {:values [ttl data tenant rollup period path time]}))
+         {:values [ttl data tenant rollup period path time]
+          :consistency :any}))
       (fetch [this agg paths tenant rollup period from to]
         (debug "fetching paths from store: " paths rollup period from to)
         (if-let [data (and (seq paths)
@@ -181,6 +188,7 @@
                                  session fetch!
                                  {:values [paths (int rollup) (int period)
                                            from to]
+                                  :consistency :one
                                   :fetch-size Integer/MAX_VALUE})
                                 (map (partial aggregate-with (keyword agg)))
                                 (seq)))]
