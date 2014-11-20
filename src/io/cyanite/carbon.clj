@@ -29,7 +29,7 @@
           metricd (parse-num #(Double/parseDouble %) "nan" metric)]
       (when (and (not= "nan" metricd) (not= "nan" timel))
           (for [{:keys [rollup period ttl rollup-to]} rollups]
-            {:path   path
+            {:path   (lower-case path)
              :rollup rollup
              :period period
              :ttl    (or ttl (* rollup period))
