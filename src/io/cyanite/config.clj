@@ -129,9 +129,10 @@
 
           (update-in [:store] (partial merge default-store))
           (update-in [:store] get-instance :store)
-          (update-in [:resolutions] convert-shorthand-rollups)
           (update-in [:resolutions] (partial mapv map->Resolution))
           (update-in [:transports] (partial mapv update-transport))
+
           (update-in [:index] (partial merge default-index))
           (update-in [:index] get-instance :index)
+
           (update-in [:http] (partial merge default-http))))))
