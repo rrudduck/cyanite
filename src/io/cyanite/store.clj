@@ -3,19 +3,112 @@
    relies on a single schema. All cassandra interaction bits
    should quickly be abstracted with a protocol to more easily
    swap implementations"
-  (:require [io.cyanite.resolution :as r]
-            [clojure.tools.logging :refer [debug]]))
+  (:require [clojure.string                   :as str]
+            [qbits.alia                       :as alia]
+            [qbits.alia.policy.reconnection   :as rc]
+            [qbits.alia.policy.retry          :as rt]
+            [qbits.alia.policy.load-balancing :as lb]
+            [io.cyanite.util                  :refer [partition-or-time go-forever go-catch]]
+            [clojure.tools.logging            :refer [error info debug]]
+            [clojure.core.async               :refer [take! <! >! go chan]])
+  (:import [com.datastax.driver.core
+            BatchStatement
+            BatchStatement$Type
+            PreparedStatement]))
 
 (set! *warn-on-reflection* true)
 
-(defrecord Metric [path time point data])
-
 (defprotocol Metricstore
-  (insert! [this tenant metric] [this tenant resolution metric])
-  (fetch [this tenant spec] [this tenant resolution spec]))
+  (insert [this ttl data tenant rollup period path time])
+  (channel-for [this])
+  (fetch [this agg paths tenant rollup period from to]))
+
+;;
+;; The following contains necessary cassandra queries. Since
+;; cyanite relies on very few queries, I decided against using
+;; hayt
+
+(defn insertq
+  "Yields a cassandra prepared statement of 6 arguments:
+
+* `ttl`: how long to keep the point around
+* `metric`: the data point
+* `rollup`: interval between points at this resolution
+* `period`: rollup multiplier which determines the time to keep points for
+* `path`: name of the metric
+* `time`: timestamp of the metric, should be divisible by rollup"
+  [session]
+  (alia/prepare
+   session
+   (str
+    "UPDATE metric USING TTL ? SET data = data + ? "
+    "WHERE tenant = '' AND rollup = ? AND period = ? AND path = ? AND time = ?;")))
+
+(defn fetchq
+  "Yields a cassandra prepared statement of 6 arguments:
+
+* `paths`: list of paths
+* `rollup`: interval between points at this resolution
+* `period`: rollup multiplier which determines the time to keep points for
+* `min`: return points starting from this timestamp
+* `max`: return points up to this timestamp
+* `limit`: maximum number of points to return"
+  [session]
+  (alia/prepare
+   session
+   (str
+    "SELECT path,data,time FROM metric WHERE "
+    "path IN ? AND tenant = '' AND rollup = ? AND period = ? "
+    "AND time >= ? AND time <= ? ORDER BY time ASC;")))
+
+
+(defn useq
+  "Yields a cassandra use statement for a keyspace"
+  [keyspace]
+  (format "USE %s;" (name keyspace)))
 
 ;;
 ;; The next section contains a series of path matching functions
+
+
+(defmulti aggregate-with
+  "This transforms a raw list of points according to the provided aggregation
+   method. Each point is stored as a list of data points, so multiple
+   methods make sense (max, min, mean). Additionally, a raw method is
+   provided"
+  (comp first list))
+
+(defmethod aggregate-with :mean
+  [_ {:keys [data] :as metric}]
+  (if (seq data)
+    (-> metric
+        (dissoc :data)
+        (assoc :metric (/ (reduce + 0.0 data) (count data))))
+    metric))
+
+(defmethod aggregate-with :sum
+  [_ {:keys [data] :as metric}]
+  (-> metric
+      (dissoc :data)
+      (assoc :metric (reduce + 0.0 data))))
+
+(defmethod aggregate-with :max
+  [_ {:keys [data] :as metric}]
+  (-> metric
+      (dissoc :data)
+      (assoc :metric (apply max data))))
+
+(defmethod aggregate-with :min
+  [_ {:keys [data] :as metric}]
+  (-> metric
+      (dissoc :data)
+      (assoc :metric (apply min data))))
+
+(defmethod aggregate-with :raw
+  [_ {:keys [data] :as metric}]
+  (-> metric
+      (dissoc :data)
+      (assoc :metric data)))
 
 (defn max-points
   "Returns the maximum number of points to expect for
@@ -30,47 +123,88 @@
 
 (defn fill-in
   "Fill in fetched data with nil metrics for a given time range"
-  [nils data]
-  (->> (group-by :time data)
-       (merge nils)
-       (map (comp first val))
-       (sort-by :time)
-       (map :metric)))
+  [nils [path data]]
+  (hash-map path
+            (->> (group-by :time data)
+                 (merge nils)
+                 (map (comp first val))
+                 (sort-by :time)
+                 (map :metric))))
 
-(defn data->series
-  [data spec resolution]
-  (when-let [points (seq (map (partial r/aggregate spec) data))]
-    (let [rollup     (:rollup resolution)
-          min-point  (-> points first :time)
-          max-point  (-> (:to spec) (quot rollup) (* rollup))
-          nil-points (->> (range min-point (inc max-point) rollup)
-                          (map (fn [t] [t [{:time t}]]))
-                          (reduce merge {}))
-          by-path    (->> (group-by :path points)
-                          (map (fn [[k v]] [k (fill-in nil-points v)]))
-                          (reduce merge {}))]
-      {:from min-point
-       :to   max-point
-       :step rollup
-       :series by-path})))
+(defn- batch
+  "Creates an unlogged batch of prepared statements"
+  [^PreparedStatement s values]
+  (let [b (BatchStatement. (BatchStatement$Type/UNLOGGED))]
+    (doseq [v values]
+      (.add b (.bind s (into-array Object v))))
+    b))
 
-(defn empty-series
-  [spec]
-  {:from (:from spec)
-   :to (:to spec)
-   :step 10 ;; inconsequent
-   :series {}})
-
-(defn wrapped-store
-  [store resolutions]
-  (reify
-    Metricstore
-    (insert! [this tenant metric]
-      (doseq [resolution resolutions
-              :let [time (r/rollup resolution (:time metric))]]
-        (insert! store tenant resolution
-                 (map->Metric (assoc metric :time time)))))
-    (fetch [this tenant spec]
-      (let [resolution (r/resolution spec resolutions)]
-        (or (data->series (fetch store tenant resolution spec) spec resolution)
-            (empty-series spec))))))
+(defn cassandra-metric-store
+  "Connect to cassandra and start a path fetching thread.
+   The interval is fixed for now, at 1minute"
+  [{:keys [keyspace cluster hints repfactor]
+    :or   {hints {:replication {:class "SimpleStrategy"
+                                :replication_factor (or repfactor 3)}}}}]
+  (info "creating cassandra metric store")
+  (let [cluster (if (sequential? cluster) cluster [cluster])
+        session (-> (alia/cluster {:contact-points cluster
+                                   :load-balancing-policy (lb/round-robin-policy)
+                                   :reconnection-policy (rc/constant-reconnection-policy 10)
+                                   :retry-policy (rt/downgrading-consistency-retry-policy)})
+                    (alia/connect keyspace))
+        insert! (insertq session)
+        fetch!  (fetchq session)]
+    (reify
+      Metricstore
+      (channel-for [this]
+        (let [ch   (chan 10000)
+              ch-p (partition-or-time 50 ch 1000 5)]
+          (go-forever
+           (let [payload (<! ch-p)]
+             (try
+               (let [values (map
+                             #(let [{:keys [metric path time rollup period ttl]} %]
+                                [(int ttl) [metric] (int rollup) (int period) path time])
+                             payload)]
+                 (take!
+                  (alia/execute-chan session (batch insert! values) {:consistency :any})
+                  (fn [rows-or-e]
+                    (if (instance? Throwable rows-or-e)
+                      (info rows-or-e "Cassandra error")
+                      (debug "Batch written")))))
+               (catch Exception e
+                 (info e "Store processing exception")))))
+          ch))
+      (insert [this ttl data tenant rollup period path time]
+        (alia/execute-chan
+         session
+         insert!
+         {:values [ttl data tenant rollup period path time]
+          :consistency :any}))
+      (fetch [this agg paths tenant rollup period from to]
+        (debug "fetching paths from store: " paths rollup period from to)
+        (if-let [data (and (seq paths)
+                           (->> (alia/execute
+                                 session fetch!
+                                 {:values [paths (int rollup) (int period)
+                                           from to]
+                                  :consistency :one
+                                  :fetch-size Integer/MAX_VALUE})
+                                (map (partial aggregate-with (keyword agg)))
+                                (seq)))]
+          (let [min-point  (:time (first data))
+                max-point  (-> to (quot rollup) (* rollup))
+                nil-points (->> (range min-point (inc max-point) rollup)
+                                (map (fn [time] {time [{:time time}]}))
+                                (reduce merge {}))
+                by-path    (->> (group-by :path data)
+                                (map (partial fill-in nil-points))
+                                (reduce merge {}))]
+            {:from min-point
+             :to   max-point
+             :step rollup
+             :series by-path})
+          {:from from
+           :to to
+           :step rollup
+           :series {}})))))

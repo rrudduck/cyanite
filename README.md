@@ -101,8 +101,6 @@ logging:
 store:
   cluster: 'localhost'
   keyspace: 'metric'
-  chan_size: 10000 # defaults to 10000
-  batch_size: 500 # defaults to 500
 ```
 
 You can also specify your rollups as [carbon-style](http://graphite.readthedocs.org/en/latest/config-carbon.html#storage-schemas-conf) retention description.
@@ -126,8 +124,6 @@ index:
   use: "io.cyanite.es_path/es-rest"
   index: "my_paths" #defaults to "cyanite_paths"
   url: "http://myes.host.com:9200" #defaults to http://localhost:9200
-  chan_size: 10000 # defaults to 10000
-  batch_size: 1000 # defaults to 1000
 ```
 
 For Native Java:
@@ -138,7 +134,6 @@ index:
   host: "192.168.1.1" # defaults to localhost
   port: 9300 # defaults to 9300
   cluster_name: "" #REQUIRED! this is specific to your cluster and has no sensible default
-  chan_size: 1000 # defaults to 1000
 ```
 
 ## Running

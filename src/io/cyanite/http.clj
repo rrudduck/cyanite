@@ -5,8 +5,7 @@
   (:require [qbits.jet.server      :as http]
             [ring.util.codec       :as codec]
             [io.cyanite.store      :as store]
-            [io.cyanite.index      :as index]
-            [io.cyanite.resolution :as r]
+            [io.cyanite.path       :as path]
             [cheshire.core         :as json]
             [clojure.string        :as str]
             [clojure.string        :refer [lower-case]]
@@ -31,6 +30,14 @@
         (reduce merge {}))
    nil))
 
+(defn find-best-rollup
+  "Find most precise storage period given the oldest point wanted"
+  [from rollups]
+  (let [within (fn [{:keys [rollup period] :as rollup-def}]
+                 (and (>= (Long/parseLong from) (- (now) (* rollup period)))
+                      rollup-def))]
+    (some within (sort-by :rollup rollups))))
+
 (defn assoc-params
   "Parse query args"
   [{:keys [query-string] :as request}]
@@ -45,6 +52,7 @@
    (assoc request :params {})))
 
 (defn match-route
+  ""
   [{:keys [uri path-info] :as request} [action re]]
   (when (re-matches re (or path-info uri))
     action))
@@ -61,19 +69,18 @@
 (defmethod process :paths
   [{{:keys [query]} :params :keys [index] :as request}]
   (debug "query now: " query)
-  (index/prefixes index "" (if (str/blank? query) "*" query)))
+  (path/prefixes index "" (if (str/blank? query) "*" query)))
 
 (defmethod process :metrics
-  [{{:keys [from to path agg]} :params :keys [index store resolutions]}]
+  [{{:keys [from to path agg]} :params :keys [index store rollups]}]
   (debug "fetching paths: " path)
-  (let [to    (if to (Long/parseLong to) (now))
-        from  (Long/parseLong from)
-        paths (mapcat (partial index/lookup index "")
-                      (if (sequential? path) path [path]))
-        agg   (keyword (or agg "mean"))
-        spec  (r/->FetchSpec agg paths from to)]
-    (debug "spec: " (pr-str spec))
-    (store/fetch store "" spec)))
+  (if-let [{:keys [rollup period]} (find-best-rollup from rollups)]
+    (let [to    (if to (Long/parseLong to) (now))
+          from  (Long/parseLong from)
+          paths (mapcat (partial path/lookup index "")
+                        (if (sequential? path) path [path]))]
+      (store/fetch store (or agg "mean") paths "" rollup period from to))
+    {:step nil :from nil :to nil :series {}}))
 
 (defmethod process :ping
   [_]
@@ -86,7 +93,7 @@
 (defn wrap-process
   "Process request, generating a JSON output for it, catch exception
    and yield a payload"
-  [request store index]
+  [request rollups store index]
   (debug "got request: " request)
   (try
     {:status  200
@@ -94,7 +101,7 @@
      :body    (json/generate-string
                (process (assoc request
                           :store store
-                          :rollups (:rollups store)
+                          :rollups rollups
                           :index index)))}
     (catch Exception e
       (let [{:keys [status body suppress?]} (ex-data e)]
@@ -105,14 +112,14 @@
          :body    (json/generate-string
                    (or body {:error (.getMessage e)}))}))))
 
-(defn server
+(defn start
   "Start the API, handling each request by parsing parameters and
    routes then handing over to the request processor"
-  [{:keys [http store index] :as config}]
+  [{:keys [http store carbon index] :as config}]
   (let [handler (fn [request]
                   (-> request
                       (assoc-params)
                       (assoc-route)
-                      (wrap-process store index)))]
+                      (wrap-process (:rollups carbon) store index)))]
     (http/run-jetty (merge http {:ring-handler handler})))
   nil)

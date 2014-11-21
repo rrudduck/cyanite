@@ -1,12 +1,9 @@
 (ns io.cyanite
   "Main cyanite namespace"
   (:gen-class)
-  (:require [io.cyanite.http   :as http]
+  (:require [io.cyanite.carbon :as carbon]
+            [io.cyanite.http   :as http]
             [io.cyanite.config :as config]
-            [io.cyanite.index  :as index]
-            [io.cyanite.store  :as store]
-            [io.cyanite.engine :refer [engine start!]]
-            [clojure.tools.logging :refer [debug]]
             [clojure.tools.cli :refer [cli]]))
 
 (set! *warn-on-reflection* true)
@@ -31,19 +28,9 @@
     (when help
       (println banner)
       (System/exit 0))
-    (let [{:keys [http] :as config} (config/init path quiet)
-          config                    (-> config
-                                        (update :store store/wrapped-store
-                                                (:precisions config))
-                                        (update :index index/wrapped-index))
-          _                         (debug "ready to start")
-          core                      (engine config)]
-      (debug "engine built, starting transports")
-      (doseq [{:keys [constructor] :as opts} (:transports config)
-              :let [transport (constructor opts core)]]
-        (debug "starting transport: " (pr-str (dissoc opts :constructor)))
-        (conj! core transport))
-      (start! core)
+    (let [{:keys [carbon http] :as config} (config/init path quiet)]
+      (when (:enabled carbon)
+        (carbon/start config))
       (when (:enabled http)
-        (http/server config))))
+        (http/start config))))
   nil)
