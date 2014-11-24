@@ -139,6 +139,15 @@
       (.add b (.bind s (into-array Object v))))
     b))
 
+(defn- get-session
+  [cluster keyspace]
+  (-> (alia/cluster {:contact-points cluster
+                     :load-balancing-policy (lb/round-robin-policy)
+                     :reconnection-policy (rc/constant-reconnection-policy 10)
+                     :retry-policy (rt/downgrading-consistency-retry-policy)})
+    (alia/connect keyspace))
+)
+
 (defn cassandra-metric-store
   "Connect to cassandra and start a path fetching thread.
    The interval is fixed for now, at 1minute"
@@ -147,18 +156,14 @@
                                 :replication_factor (or repfactor 3)}}}}]
   (info "creating cassandra metric store")
   (let [cluster (if (sequential? cluster) cluster [cluster])
-        session (-> (alia/cluster {:contact-points cluster
-                                   :load-balancing-policy (lb/round-robin-policy)
-                                   :reconnection-policy (rc/constant-reconnection-policy 10)
-                                   :retry-policy (rt/downgrading-consistency-retry-policy)})
-                    (alia/connect keyspace))
+        session (get-session cluster keyspace)
         insert! (insertq session)
         fetch!  (fetchq session)]
     (reify
       Metricstore
       (channel-for [this]
         (let [ch   (chan 10000)
-              ch-p (partition-or-time 50 ch 1000 5)]
+              ch-p (partition-or-time 500 ch 500 5)]
           (go-forever
            (let [payload (<! ch-p)]
              (try
@@ -167,20 +172,21 @@
                                 [(int ttl) [metric] (int rollup) (int period) path time])
                              payload)]
                  (take!
-                  (alia/execute-chan session (batch insert! values) {:consistency :any})
+                  (alia/execute-chan session (batch insert! values) {:consistency :one})
                   (fn [rows-or-e]
                     (if (instance? Throwable rows-or-e)
                       (info rows-or-e "Cassandra error")
                       (debug "Batch written")))))
                (catch Exception e
-                 (info e "Store processing exception")))))
+                 (info e "Store processing exception")
+                 session (get-session)))))
           ch))
       (insert [this ttl data tenant rollup period path time]
         (alia/execute-chan
          session
          insert!
          {:values [ttl data tenant rollup period path time]
-          :consistency :any}))
+          :consistency :one}))
       (fetch [this agg paths tenant rollup period from to]
         (debug "fetching paths from store: " paths rollup period from to)
         (if-let [data (and (seq paths)
