@@ -57,9 +57,9 @@
   (alia/prepare
    session
    (str
-    "SELECT path,data,time FROM metric WHERE "
+    "SELECT path, data, time FROM metric WHERE "
     "path IN ? AND tenant = '' AND rollup = ? AND period = ? "
-    "AND time >= ? AND time <= ? ORDER BY time ASC;")))
+    "AND time >= ? AND time <= ?;")))
 
 
 (defn useq
@@ -151,9 +151,11 @@
 (defn cassandra-metric-store
   "Connect to cassandra and start a path fetching thread.
    The interval is fixed for now, at 1minute"
-  [{:keys [keyspace cluster hints repfactor]
+  [{:keys [keyspace cluster hints repfactor chan_size batch_size]
     :or   {hints {:replication {:class "SimpleStrategy"
-                                :replication_factor (or repfactor 3)}}}}]
+                                :replication_factor (or repfactor 3)}}
+           chan_size 10000
+           batch_size 500}}]
   (info "creating cassandra metric store")
   (let [cluster (if (sequential? cluster) cluster [cluster])
         session (get-session cluster keyspace)
@@ -162,8 +164,8 @@
     (reify
       Metricstore
       (channel-for [this]
-        (let [ch   (chan 10000)
-              ch-p (partition-or-time 500 ch 500 5)]
+        (let [ch   (chan chan_size)
+              ch-p (partition-or-time batch_size ch batch_size 5)]
           (go-forever
            (let [payload (<! ch-p)]
              (try
@@ -178,8 +180,7 @@
                       (info rows-or-e "Cassandra error")
                       (debug "Batch written")))))
                (catch Exception e
-                 (info e "Store processing exception")
-                 session (get-session)))))
+                 (info e "Store processing exception")))))
           ch))
       (insert [this ttl data tenant rollup period path time]
         (alia/execute-chan
