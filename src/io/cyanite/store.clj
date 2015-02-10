@@ -142,9 +142,7 @@
 (defn- get-session
   [cluster keyspace]
   (-> (alia/cluster {:contact-points cluster
-                     :load-balancing-policy (lb/round-robin-policy)
-                     :reconnection-policy (rc/constant-reconnection-policy 10)
-                     :retry-policy (rt/downgrading-consistency-retry-policy)})
+                     :reconnection-policy (rc/constant-reconnection-policy 1000)})
     (alia/connect keyspace))
 )
 

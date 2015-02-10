@@ -15,11 +15,11 @@
                  [clj-yaml                      "0.4.0"]
                  [clj-http                      "1.0.1"
                   :exclusions [commons-codec]]
-                 [cc.qbits/jet                  "0.5.0-beta4"]
+                 [cc.qbits/jet                  "0.5.3"]
                  [cc.qbits/alia                 "2.3.1"]
                  [net.jpountz.lz4/lz4           "1.2.0"]
                  [org.xerial.snappy/snappy-java "1.1.1.3"]
-                 [io.netty/netty-all            "4.0.19.Final"]
+                 [io.netty/netty-all            "4.0.25.Final"]
                  [org.clojure/core.async        "0.1.346.0-17112a-alpha"]
                  [clojurewerkz/elastisch        "2.0.0"
                   :exclusions [com.google.guava/guava commons-codec]]])
