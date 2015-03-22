@@ -140,23 +140,24 @@
     b))
 
 (defn- get-session
-  [cluster keyspace]
+  [cluster keyspace datacenter]
   (-> (alia/cluster {:contact-points cluster
-                     :reconnection-policy (rc/constant-reconnection-policy 1000)})
+                     :reconnection-policy (rc/constant-reconnection-policy 1000)
+                     :load-balancing-policy (lb/token-aware-policy (lb/dc-aware-round-robin-policy datacenter 4))})
     (alia/connect keyspace))
 )
 
 (defn cassandra-metric-store
   "Connect to cassandra and start a path fetching thread.
    The interval is fixed for now, at 1minute"
-  [{:keys [keyspace cluster hints repfactor chan_size batch_size]
+  [{:keys [keyspace cluster hints repfactor datacenter chan_size batch_size]
     :or   {hints {:replication {:class "SimpleStrategy"
                                 :replication_factor (or repfactor 3)}}
            chan_size 10000
            batch_size 500}}]
   (info "creating cassandra metric store")
   (let [cluster (if (sequential? cluster) cluster [cluster])
-        session (get-session cluster keyspace)
+        session (get-session cluster keyspace datacenter)
         insert! (insertq session)
         fetch!  (fetchq session)]
     (reify
